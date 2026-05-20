@@ -10,8 +10,26 @@ from hamer.models import HAMER, download_models, load_hamer, DEFAULT_CHECKPOINT
 from hamer.utils import recursive_to
 from hamer.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from hamer.utils.renderer import Renderer, cam_crop_to_full
+from hamer.utils.render_openpose import render_openpose
 
 LIGHT_BLUE=(0.65098039,  0.74117647,  0.85882353)
+
+def _vector_normalization_3d(joint):
+    """HaMeR 3D 키포인트 기반 관절 벡터/각도 계산 (joint: (21, 3))
+
+    Returns:
+        v     : (20, 3) 정규화된 관절 방향 벡터
+        angle : (15,)  인접 뼈대 간 각도 (degrees)
+    Feature dim: vector 60 + angle 15 = 75-dim
+    """
+    v1 = joint[[0,1,2,3,0,5,6,7,0,9,10,11,0,13,14,15,0,17,18,19]]  # parent joints
+    v2 = joint[[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]]  # child joints
+    v = v2 - v1
+    v = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-8)
+    angle = np.arccos(np.clip(np.einsum('nt,nt->n',
+        v[[0,1,2,4,5,6,8,9,10,12,13,14,16,17,18]],
+        v[[1,2,3,5,6,7,9,10,11,13,14,15,17,18,19]]), -1.0, 1.0))
+    return v, np.degrees(angle).astype(np.float32)
 
 from vitpose_model import ViTPoseModel
 
@@ -30,6 +48,7 @@ def main():
     parser.add_argument('--rescale_factor', type=float, default=2.0, help='Factor for padding the bbox')
     parser.add_argument('--body_detector', type=str, default='vitdet', choices=['vitdet', 'regnety'], help='Using regnety improves runtime and reduces memory')
     parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'], help='List of file extensions to consider')
+    parser.add_argument('--skeleton', dest='skeleton', action='store_true', default=False, help='If set, render skeleton instead of mesh')
 
     args = parser.parse_args()
 
@@ -127,6 +146,7 @@ def main():
         all_verts = []
         all_cam_t = []
         all_right = []
+        all_kp3d = []
         
         for batch in dataloader:
             batch = recursive_to(batch, device)
@@ -153,23 +173,38 @@ def main():
                 input_patch = batch['img'][n].cpu() * (DEFAULT_STD[:,None,None]/255) + (DEFAULT_MEAN[:,None,None]/255)
                 input_patch = input_patch.permute(1,2,0).numpy()
 
-                regression_img = renderer(out['pred_vertices'][n].detach().cpu().numpy(),
-                                        out['pred_cam_t'][n].detach().cpu().numpy(),
-                                        batch['img'][n],
-                                        mesh_base_color=LIGHT_BLUE,
-                                        scene_bg_color=(1, 1, 1),
-                                        )
-
-                if args.side_view:
-                    side_img = renderer(out['pred_vertices'][n].detach().cpu().numpy(),
+                if args.skeleton:
+                    # Project 3D keypoints using crop camera (same approach as _all view)
+                    kp3d = out['pred_keypoints_3d'][n].detach().cpu().numpy()  # (21, 3)
+                    cam_t_crop = out['pred_cam_t'][n].detach().cpu().numpy()   # (3,)
+                    H_crop, W_crop = input_patch.shape[:2]  # 256, 192
+                    f_crop = float(model_cfg.EXTRA.FOCAL_LENGTH)  # 5000
+                    kp3d_cam = kp3d + cam_t_crop
+                    x_pixel = f_crop * kp3d_cam[:, 0] / kp3d_cam[:, 2] + W_crop / 2
+                    y_pixel = f_crop * kp3d_cam[:, 1] / kp3d_cam[:, 2] + H_crop / 2
+                    kp_with_conf = np.concatenate([
+                        np.stack([x_pixel, y_pixel], axis=1),
+                        np.ones((kp3d.shape[0], 1))
+                    ], axis=1)
+                    skel_img = render_openpose((input_patch * 255).astype(np.uint8), kp_with_conf) / 255.
+                    final_img = np.concatenate([input_patch, skel_img], axis=1)
+                else:
+                    regression_img = renderer(out['pred_vertices'][n].detach().cpu().numpy(),
                                             out['pred_cam_t'][n].detach().cpu().numpy(),
-                                            white_img,
+                                            batch['img'][n],
                                             mesh_base_color=LIGHT_BLUE,
                                             scene_bg_color=(1, 1, 1),
-                                            side_view=True)
-                    final_img = np.concatenate([input_patch, regression_img, side_img], axis=1)
-                else:
-                    final_img = np.concatenate([input_patch, regression_img], axis=1)
+                                            )
+                    if args.side_view:
+                        side_img = renderer(out['pred_vertices'][n].detach().cpu().numpy(),
+                                                out['pred_cam_t'][n].detach().cpu().numpy(),
+                                                white_img,
+                                                mesh_base_color=LIGHT_BLUE,
+                                                scene_bg_color=(1, 1, 1),
+                                                side_view=True)
+                        final_img = np.concatenate([input_patch, regression_img, side_img], axis=1)
+                    else:
+                        final_img = np.concatenate([input_patch, regression_img], axis=1)
 
                 cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_{person_id}.png'), 255*final_img[:, :, ::-1])
 
@@ -182,6 +217,29 @@ def main():
                 all_cam_t.append(cam_t)
                 all_right.append(is_right)
 
+                # 3D 피처 저장 (76-dim: vector 60 + angle 15 + label 1)
+                kp3d = out['pred_keypoints_3d'][n].detach().cpu().numpy()  # (21, 3)
+                vector, angle = _vector_normalization_3d(kp3d)
+                feature = np.concatenate([
+                    vector.flatten(),                           # 60
+                    angle.flatten(),                            # 15
+                    np.array([-1], dtype=np.float32),          # label (미지정)
+                ])                                              # → 76-dim
+                hand_side = 'right' if is_right else 'left'
+                np.savez(
+                    os.path.join(args.out_folder, f'{img_fn}_{person_id}_{hand_side}_3d.npz'),
+                    keypoints_3d=kp3d,              # (21, 3) 원본 3D 키포인트
+                    vectors=vector,                 # (20, 3) 정규화 방향 벡터
+                    angles=angle,                   # (15,)  인접 뼈대 각도 (degrees)
+                    features=feature,               # (76,)  통합 피처
+                    is_right=np.array([is_right]),
+                )
+
+                if args.skeleton:
+                    kp3d = out['pred_keypoints_3d'][n].detach().cpu().numpy()  # (21, 3)
+                    kp3d[:, 0] = (2 * is_right - 1) * kp3d[:, 0]
+                    all_kp3d.append(kp3d)
+
                 # Save all meshes to disk
                 if args.save_mesh:
                     camera_translation = cam_t.copy()
@@ -190,19 +248,33 @@ def main():
 
         # Render front view
         if args.full_frame and len(all_verts) > 0:
-            misc_args = dict(
-                mesh_base_color=LIGHT_BLUE,
-                scene_bg_color=(1, 1, 1),
-                focal_length=scaled_focal_length,
-            )
-            cam_view = renderer.render_rgba_multiple(all_verts, cam_t=all_cam_t, render_res=img_size[n], is_right=all_right, **misc_args)
+            if args.skeleton:
+                img_h_full, img_w_full = img_cv2.shape[:2]
+                f = float(scaled_focal_length)
+                full_skel_img = img_cv2.astype(np.float32)[:, :, ::-1] / 255.0
+                for kp3d, cam_t in zip(all_kp3d, all_cam_t):
+                    kp3d_cam = kp3d + cam_t
+                    kp2d_full = np.stack([
+                        f * kp3d_cam[:, 0] / kp3d_cam[:, 2] + img_w_full / 2,
+                        f * kp3d_cam[:, 1] / kp3d_cam[:, 2] + img_h_full / 2,
+                    ], axis=1)
+                    kp_with_conf = np.concatenate([kp2d_full, np.ones((kp2d_full.shape[0], 1))], axis=1)
+                    full_skel_img = render_openpose((full_skel_img * 255).astype(np.uint8), kp_with_conf) / 255.
+                cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_all.jpg'), 255 * full_skel_img[:, :, ::-1])
+            else:
+                misc_args = dict(
+                    mesh_base_color=LIGHT_BLUE,
+                    scene_bg_color=(1, 1, 1),
+                    focal_length=scaled_focal_length,
+                )
+                cam_view = renderer.render_rgba_multiple(all_verts, cam_t=all_cam_t, render_res=img_size[n], is_right=all_right, **misc_args)
 
-            # Overlay image
-            input_img = img_cv2.astype(np.float32)[:,:,::-1]/255.0
-            input_img = np.concatenate([input_img, np.ones_like(input_img[:,:,:1])], axis=2) # Add alpha channel
-            input_img_overlay = input_img[:,:,:3] * (1-cam_view[:,:,3:]) + cam_view[:,:,:3] * cam_view[:,:,3:]
+                # Overlay image
+                input_img = img_cv2.astype(np.float32)[:,:,::-1]/255.0
+                input_img = np.concatenate([input_img, np.ones_like(input_img[:,:,:1])], axis=2) # Add alpha channel
+                input_img_overlay = input_img[:,:,:3] * (1-cam_view[:,:,3:]) + cam_view[:,:,:3] * cam_view[:,:,3:]
 
-            cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_all.jpg'), 255*input_img_overlay[:, :, ::-1])
+                cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_all.jpg'), 255*input_img_overlay[:, :, ::-1])
 
 if __name__ == '__main__':
     main()

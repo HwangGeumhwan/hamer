@@ -22,14 +22,16 @@ class ViTDetDataset(torch.utils.data.Dataset):
                  right: np.array,
                  rescale_factor=2.5,
                  train: bool = False,
+                 verbose: bool = False,
                  **kwargs):
         super().__init__()
         self.cfg = cfg
         self.img_cv2 = img_cv2
-        # self.boxes = boxes
+        self.verbose = verbose
 
         assert train == False, "ViTDetDataset is only for inference"
         self.train = train
+        self.blur_applied = False
         self.img_size = cfg.MODEL.IMAGE_SIZE
         self.mean = 255. * np.array(self.cfg.MODEL.IMAGE_MEAN)
         self.std = 255. * np.array(self.cfg.MODEL.IMAGE_STD)
@@ -65,10 +67,12 @@ class ViTDetDataset(torch.utils.data.Dataset):
         if True:
             # Blur image to avoid aliasing artifacts
             downsampling_factor = ((bbox_size*1.0) / patch_width)
-            print(f'{downsampling_factor=}')
+            if self.verbose:
+                print(f'{downsampling_factor=}')
             downsampling_factor = downsampling_factor / 2.0
             if downsampling_factor > 1.1:
                 cvimg  = gaussian(cvimg, sigma=(downsampling_factor-1)/2, channel_axis=2, preserve_range=True)
+                self.blur_applied = True
 
 
         img_patch_cv, trans = generate_image_patch_cv2(cvimg,
