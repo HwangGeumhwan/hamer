@@ -48,6 +48,9 @@ def load_hamer(checkpoint_path=DEFAULT_CHECKPOINT, init_renderer=True):
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
         model_cfg.freeze()
 
+    import torch
+    map_loc = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = HAMER.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg,
-                                       init_renderer=init_renderer)
+                                       init_renderer=init_renderer,
+                                       map_location=map_loc)
     return model, model_cfg

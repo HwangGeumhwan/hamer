@@ -24,22 +24,6 @@ from sklearn.preprocessing import StandardScaler
 import joblib
 
 
-def _aug_rotation_matrix(std_deg: float = 10.0) -> np.ndarray:
-    angles = np.random.normal(0, np.radians(std_deg), 3).astype(np.float64)
-    c, s = np.cos(angles), np.sin(angles)
-    Rx = np.array([[1, 0, 0], [0, c[0], -s[0]], [0, s[0], c[0]]])
-    Ry = np.array([[c[1], 0, s[1]], [0, 1, 0], [-s[1], 0, c[1]]])
-    Rz = np.array([[c[2], -s[2], 0], [s[2], c[2], 0], [0, 0, 1]])
-    return (Rz @ Ry @ Rx).astype(np.float32)
-
-
-def _augment_sample(x: np.ndarray) -> np.ndarray:
-    x = x.copy()
-    R = x[26:35].reshape(3, 3)
-    dR = _aug_rotation_matrix(10.0)
-    x[26:35] = (dR @ R).flatten()
-    x[8] = float(np.clip(x[8] + np.random.normal(0, 5.0), 0, 180))
-    return x
 
 ACTIONS = [
     'ㄱ', 'ㄴ', 'ㄷ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅅ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
@@ -123,6 +107,8 @@ def main():
     parser.add_argument('--epochs',     type=int,   default=300)
     parser.add_argument('--batch_size', type=int,   default=32)
     parser.add_argument('--lr',         type=float, default=1e-3)
+    parser.add_argument('--all',        action='store_true',
+                        help='train + eval 전체를 학습에 사용 (val 없음)')
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -138,22 +124,24 @@ def main():
     ex, ey = eval_raw['x'].astype(np.float32), eval_raw['y'].astype(np.int64)
     print(f"Eval  데이터: x={ex.shape}, y={ey.shape}")
 
+    if args.all:
+        x = np.concatenate([x, ex], axis=0)
+        y = np.concatenate([y, ey], axis=0)
+        print(f"--all: train+eval 합산 → x={x.shape}")
+
     scaler = StandardScaler()
-    x  = scaler.fit_transform(x).astype(np.float32)
-    ex = scaler.transform(ex).astype(np.float32)
+    x = scaler.fit_transform(x).astype(np.float32)
+    if not args.all:
+        ex = scaler.transform(ex).astype(np.float32)
     joblib.dump(scaler, out_dir / 'scaler.pkl')
     print(f"Scaler 저장: {out_dir / 'scaler.pkl'}")
 
-    aug_copies = [np.array([_augment_sample(x[i]) for i in range(len(x))]) for _ in range(4)]
-    x_aug = np.concatenate([x] + aug_copies, axis=0).astype(np.float32)
-    y_aug = np.tile(y, 5)
-    print(f"증강 후 Train: {x_aug.shape}  ({len(x)} × 5)")
-
-    train_ds = GestureDataset(x_aug, y_aug)
-    val_ds   = GestureDataset(ex, ey)
-
+    train_ds     = GestureDataset(x, y)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size)
+
+    if not args.all:
+        val_ds     = GestureDataset(ex, ey)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
     # 모델
     model     = GestureMLP(input_dim=x.shape[1]).to(device)
@@ -166,17 +154,21 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion, device)
-        vl_loss, vl_acc = eval_epoch(model, val_loader, criterion, device)
         scheduler.step()
 
         history['train_loss'].append(tr_loss)
-        history['val_loss'].append(vl_loss)
         history['train_acc'].append(tr_acc)
-        history['val_acc'].append(vl_acc)
 
-        print(f"Epoch {epoch:3d}/{args.epochs} | "
-              f"Train  loss: {tr_loss:.4f}  acc: {tr_acc:.4f} | "
-              f"Val  loss: {vl_loss:.4f}  acc: {vl_acc:.4f}")
+        if args.all:
+            print(f"Epoch {epoch:3d}/{args.epochs} | "
+                  f"Train  loss: {tr_loss:.4f}  acc: {tr_acc:.4f}")
+        else:
+            vl_loss, vl_acc = eval_epoch(model, val_loader, criterion, device)
+            history['val_loss'].append(vl_loss)
+            history['val_acc'].append(vl_acc)
+            print(f"Epoch {epoch:3d}/{args.epochs} | "
+                  f"Train  loss: {tr_loss:.4f}  acc: {tr_acc:.4f} | "
+                  f"Val  loss: {vl_loss:.4f}  acc: {vl_acc:.4f}")
 
     torch.save(model.state_dict(), out_dir / 'gesture_mlp.pth')
     print(f"\n마지막 epoch 모델 저장  →  {out_dir/'gesture_mlp.pth'}")
@@ -184,10 +176,12 @@ def main():
     # 학습 곡선 저장
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     ax1.plot(history['train_loss'], label='train')
-    ax1.plot(history['val_loss'],   label='val')
+    if not args.all:
+        ax1.plot(history['val_loss'], label='val')
     ax1.set_title('Loss'); ax1.legend()
     ax2.plot(history['train_acc'], label='train')
-    ax2.plot(history['val_acc'],   label='val')
+    if not args.all:
+        ax2.plot(history['val_acc'], label='val')
     ax2.set_title('Accuracy'); ax2.legend()
     plt.tight_layout()
     plt.savefig(out_dir / 'train_curve.png', dpi=120)

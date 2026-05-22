@@ -50,7 +50,7 @@ _extract_26d = _extract_from_75d
 def _finger_tip_dists(frame_npz_path: Path) -> np.ndarray:
     """keypoints_3d (21,3) → 정규화된 검-중, 중-약 손끝 거리 (2-dim).
 
-    정규화 기준: 손목(0) - 중지 MCP(9) 거리.
+    정규화 기준: 중지 MCP(9) - 중지 TIP(12) 거리.
     frame npz가 없거나 keypoints_3d 키가 없으면 zeros 반환.
     """
     if not frame_npz_path.exists():
@@ -59,10 +59,10 @@ def _finger_tip_dists(frame_npz_path: Path) -> np.ndarray:
     if 'keypoints_3d' not in d:
         return np.zeros(2, dtype=np.float32)
     kp    = d['keypoints_3d']                          # (21, 3)
-    scale = np.linalg.norm(kp[9] - kp[12]) + 1e-8     # 중지 MCP - 중지 TIP (손가락 길이)
+    scale = np.linalg.norm(kp[9] - kp[12]) + 1e-8     # 중지 MCP - 중지 TIP
     return np.array([
-        np.linalg.norm(kp[8]  - kp[12]) / scale,      # 검지 TIP - 중지 TIP
-        np.linalg.norm(kp[12] - kp[16]) / scale,      # 중지 TIP - 약지 TIP
+        np.linalg.norm(kp[8]  - kp[12]) / scale,      # 검지 TIP - 중지 TIP  (ㅅ-ㅠ)
+        np.linalg.norm(kp[12] - kp[16]) / scale,      # 중지 TIP - 약지 TIP  (ㄹ-ㅌ)
     ], dtype=np.float32)
 
 

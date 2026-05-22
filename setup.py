@@ -7,7 +7,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'gdown',
-        'numpy',
+        'numpy<2',
         'opencv-python==4.8.1.78',  # numpy 1.x 호환 (4.9+ 는 numpy>=2 요구)
         'pyrender',
         'pytorch-lightning==2.0.3',
