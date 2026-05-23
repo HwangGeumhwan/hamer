@@ -85,8 +85,9 @@ echo "==== [7/9] chumpy 설치 및 numpy 2.x 호환 패치 ===="
 conda run -n $ENV_NAME pip install --no-build-isolation --ignore-installed --no-deps chumpy
 
 echo "  -> chumpy numpy 2.x 호환 패치 적용..."
-# 실제 설치 위치를 동적으로 감지 (conda env 우선, ~/.local fallback)
-CHUMPY_DIR=$(conda run -n $ENV_NAME python -c "import chumpy, os; print(os.path.dirname(chumpy.__file__))" 2>/dev/null)
+# import로 탐지하면 numpy 2.x 환경에서 chumpy 자체가 깨져 exit code 1 → set -e 로 스크립트 종료
+# SITE_PACKAGES는 스크립트 상단에 이미 정의됨 ($ENV_PATH/lib/python3.10/site-packages)
+CHUMPY_DIR="$SITE_PACKAGES/chumpy"
 if [ -d "$CHUMPY_DIR" ]; then
     for f in "$CHUMPY_DIR"/*.py; do
         sed -i \
